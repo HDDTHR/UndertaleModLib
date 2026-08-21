@@ -1,0 +1,161 @@
+name: Build
+
+on:
+  schedule:
+    - cron: '0 */6 * * *'
+  workflow_dispatch:
+    inputs:
+      umt_ref:
+        description: "UndertaleModTool ref (defaults to its latest release tag)"
+        required: false
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  check-version:
+    runs-on: ubuntu-latest
+
+    outputs:
+      new_version: ${{ steps.compare.outputs.new_version }}
+      upstream_tag: ${{ steps.compare.outputs.upstream_tag }}
+
+    steps:
+      - name: Check Latest Releases
+        id: compare
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          UPSTREAM_TAG=$(gh api \
+            "repos/UnderminersTeam/UndertaleModTool/releases/latest" \
+            --jq '.tag_name')
+          echo "Upstream tag: $UPSTREAM_TAG"
+
+          if [ -n "${{ github.event.inputs.umt_ref }}" ]; then
+            echo "upstream_tag=${{ github.event.inputs.umt_ref }}" >> "$GITHUB_OUTPUT"
+            echo "new_version=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [ "${{ github.event_name }}" = "schedule" ]; then
+            CURRENT_TAG=$(gh api \
+              "repos/${{ github.repository }}/releases/latest" \
+              --jq '.tag_name' 2>/dev/null || echo "")
+            echo "Current tag:  ${CURRENT_TAG:-none}"
+
+            if [[ "$CURRENT_TAG" != "$UPSTREAM_TAG" ]]; then
+              echo "new_version=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "new_version=false" >> "$GITHUB_OUTPUT"
+            fi
+          else
+            echo "new_version=true" >> "$GITHUB_OUTPUT"
+          fi
+
+          echo "upstream_tag=$UPSTREAM_TAG" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: check-version
+    if: needs.check-version.outputs.new_version == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Checkout UndertaleModTool sources
+        uses: actions/checkout@v4
+        with:
+          repository: UnderminersTeam/UndertaleModTool
+          ref: ${{ needs.check-version.outputs.upstream_tag }}
+          submodules: recursive
+          path: umt
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Publish UndertaleModLib
+        run: dotnet publish umt/UndertaleModLib --output umt/out
+
+      - name: Bundle assemblies
+        run: |
+          mkdir -p src/undertale_mod_lib/_lib
+          find umt/out -maxdepth 1 -name "*.dll" -exec cp {} src/undertale_mod_lib/_lib/ \;
+          cp umt/out/*.deps.json src/undertale_mod_lib/_lib/
+          cp -r umt/out/GameSpecificData src/undertale_mod_lib/_lib/
+          for rid in linux-x64 linux-arm64 osx-x64 osx-arm64 win-x64 win-arm64; do
+            mkdir -p "src/undertale_mod_lib/_lib/runtimes/$rid"
+            cp -r "umt/out/runtimes/$rid/native" "src/undertale_mod_lib/_lib/runtimes/$rid/"
+          done
+
+      - name: Generate Python stubs
+        run: |
+          dotnet tool install --global PythonNetStubGenerator.Tool --version 1.2.1
+          echo "$HOME/.dotnet/tools" >> "$GITHUB_PATH"
+          REF_PACK=$(ls -d "${DOTNET_ROOT:-/usr/share/dotnet}"/packs/Microsoft.NETCore.App.Ref/*/ref/net10.0 | tail -1)
+          LIB=src/undertale_mod_lib/_lib
+          DOTNET_ROLL_FORWARD=LatestMajor GeneratePythonNetStubs \
+            --dest-path="src/undertale_mod_lib/typings" \
+            --target-dlls="$LIB/UndertaleModLib.dll,$LIB/Underanalyzer.dll,$LIB/Magick.NET.Core.dll,$LIB/Magick.NET-Q8-AnyCPU.dll,$REF_PACK/System.Collections.dll,$REF_PACK/System.Collections.NonGeneric.dll,$REF_PACK/System.ObjectModel.dll" \
+            --search-paths="$LIB"
+          cp -r overlay/. src/undertale_mod_lib/typings/
+          rm -rf src/undertale_mod_lib/typings/Internal
+
+      - name: Create auto-discovered stub packages
+        run: |
+          mkdir -p stubs
+          for ns in src/undertale_mod_lib/typings/*/; do
+            cp -r "$ns" "stubs/$(basename "$ns")-stubs"
+          done
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install uv
+        run: python -m pip install uv
+
+      - name: Smoke test
+        run: |
+          uv sync --frozen
+          uv run python -c "
+          import undertale_mod_lib as uml
+
+          data = uml.UndertaleModLib.UndertaleData.CreateNew()
+          assert type(data).__name__ == 'UndertaleData'
+          from Underanalyzer.Decompiler import GlobalFunctions
+
+          print('smoke test passed')
+          "
+
+      - name: Set package version from UndertaleModTool tag
+        run: |
+          tag="${{ needs.check-version.outputs.upstream_tag }}"
+          sed -i "s/^version = \".*\"/version = \"${tag#v}\"/" pyproject.toml
+          grep '^version' pyproject.toml
+
+      - name: Build distributions
+        run: uv build --wheel
+
+      - name: Create Release
+        if: github.event_name != 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.check-version.outputs.upstream_tag }}
+        run: |
+          gh release create "$TAG" \
+            --repo "${{ github.repository }}" \
+            --title "$TAG" \
+            --generate-notes \
+            dist/* || gh release upload "$TAG" --repo "${{ github.repository }}" --clobber dist/*
